@@ -19,6 +19,18 @@ often leave open. Tasks with a def line go through the plain path.
 A reply that settles nothing ("not specified", "cannot answer") is not used to
 rewrite the program; the programs from before the question are kept instead.
 
+The question reads back what the leading program does: its arguments, its
+result, its rule and one ordinary call with the output it really gave, and
+asks whether that is right or whether the part it is least sure about should
+be different. When an example in the task disagrees with the text, the
+question asks about that example instead.
+
+After the answer, three final programs are written. The chosen one is checked
+against the answer's asserts and the task's own examples; a check that no final
+passes is dropped, since the answer may have overruled it. If the chosen program
+fails a check that is left, it is asked to fix just that, and the fix is kept only
+if it passes more checks, fails none it passed and crashes no more often.
+
 Team: RankOne
 Team Members: Md Zahidul Haque
 Main Contact: mhaque@wm.edu
@@ -49,8 +61,14 @@ Write a self-contained Python solution for the task below.
 The tests call a top-level function (or class, if the task describes one) named `{entry_point}`. Use
 exactly that name, even if the task text calls it something else. Only define it and any helpers: no
 `__main__` block, prints, input() or asserts. Do not access files, the network or the shell, and do not use eval or exec.
-Put the code in ```python and ```.
+{rules}Put the code in ```python and ```.
 """.strip()
+
+CODE_RULES = """Make it return a result for every input of the kind the task describes: do not add checks that
+raise errors unless the task asks for them, and do not assume the input is sorted, distinct or
+non-empty unless the task says so. Accept a list or a tuple wherever a sequence is passed. Where the
+task is vague, do what the name `{entry_point}` suggests.
+"""
 
 PROBE_TEMPLATE = """
 Task (implement `{entry_point}`):
@@ -122,6 +140,42 @@ Take it as a hint about where the task is open, not as the question itself; the 
 most may be elsewhere.
 {lines}
 """
+
+READBACK_TEMPLATE = """
+Task (the tests call `{entry_point}`):
+{prompt}
+
+Our current program:
+```python
+{draft}
+```
+{evidence}
+Before writing the final version we will ask the user one question about this program.
+
+If an example in the task disagrees with the task's own text, reply with one line
+CLASH: <the question>
+that quotes the example call with its stated result, says what the text implies for that same call,
+and asks which of the two is intended.
+
+Otherwise describe what the program above does on ordinary inputs, in plain words without code, in
+four lines:
+ARGS: <the arguments `{entry_point}` takes, in order, with their types and shape>
+RETURNS: <the exact type and format of the result>
+RULE: <what it computes, in one sentence and in the task's own terms; where the drafts disagreed
+(notes above), say what this program does there>
+ALT: <the most likely other behaviour for the part the task leaves most open, written to follow
+"or should it instead": first an unclear result format or argument shape, then the core rule; not
+empty, zero or invalid input unless nothing else is open>
+Keep each line under 25 words.
+""".strip()
+
+READBACK_NOTES = """
+Notes (the user has not seen these): drafts of the program were run on the same inputs and gave
+different results here:
+{lines}
+"""
+
+DRAFT_LIMIT = 4000
 
 ANSWER_CONTEXT = """
 The user was asked: {question}
@@ -328,6 +382,18 @@ for _t in _TESTS:
         _out[_name] += _passed
     _emit(_out)
 """
+
+# the same, with one 0/1 per test instead of a count
+CHECK_RUNNER = TEST_RUNNER.replace(
+    "_out = {{_name: 0 for _name in _SOURCES}}", "_out = {{_name: [] for _name in _SOURCES}}"
+).replace("_out[_name] += _passed", "_out[_name].append(_passed)")
+
+REPAIR_NOTE = """
+Your program fails these checks:
+{failing}
+Fix it so that they pass, and change nothing else about what it does. Return the whole program in
+```python and ```.
+""".strip()
 
 # the sandbox kills the process at 30s, so stop early
 EXEC_DEADLINE_SECONDS = 15
@@ -561,6 +627,85 @@ def quote_in_task(quote: str, prompt: str) -> bool:
     return bool(words) and words in squash(prompt)
 
 
+FIELD = r"^[\s*>`\-\d.)]*(ARGS|RETURNS|RULE|ALT|CLASH)[\s*]*:[\s*]*(.*)$"
+
+CALL = r"\w+\((?:[^()]|\([^()]*\))*\)"
+
+
+def fill(template: str, **fields: str) -> str:
+    """Fill {name} slots in one pass, so braces inside the task or the program stay as they are."""
+    return re.sub(r"\{(\w+)\}", lambda m: fields.get(m.group(1), m.group(0)), template)
+
+
+def plain(text: str, size: int = 300) -> str:
+    """One clause for the read-back: no code marks, no question marks, no closing full stop."""
+    text = " ".join(text.replace("`", "").replace("?", "").replace("*", "").split()).rstrip(" .;")
+    return clip(text, size) if text else ""
+
+
+def parse_fields(text: str) -> dict[str, str]:
+    """The marked lines of the read-back reply; a wrapped sentence is joined back to its line."""
+    raw, last = {}, None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        match = re.match(FIELD, line, flags=re.IGNORECASE)
+        if match:
+            last = match.group(1).upper()
+            if last in raw:
+                last = None  # a repeated field: keep the first one
+            else:
+                raw[last] = match.group(2).strip()
+        elif last and line[:1].islower() and not raw[last].endswith((".", "!", "?")):
+            raw[last] += " " + line
+        else:
+            last = None
+    return {k: v.strip() if k == "CLASH" else plain(v) for k, v in raw.items()}
+
+
+def cites_task_call(question: str, prompt: str) -> bool:
+    """A clash question has to quote a call that is really written in the task."""
+    key = lambda s: re.sub(r"\s+", "", squash(s))  # noqa: E731
+    return any(key(call) in key(prompt) for call in re.findall(CALL, question))
+
+
+def edge_input(args) -> bool:
+    """An empty, zero, None or negative argument: the tests rarely hinge on such a call."""
+    for a in args:
+        if a is None or (isinstance(a, int | float) and not isinstance(a, bool) and a <= 0):
+            return True
+        if isinstance(a, str | list | tuple | dict | set) and len(a) == 0:
+            return True
+    return not args
+
+
+def render_readback(entry_point: str, args: str, returns: str, rule: str, alt: str, example) -> str:
+    text = f"About {entry_point}: my current version takes {args} and returns {returns}; {rule}."
+    if example:
+        text += f" For example, {example[0]} returns {example[1]}."
+    return f"{text} Is that right, or should it instead {alt}?"
+
+
+def stated_checks(prompt: str, entry_point: str) -> list[str]:
+    """The task's `>>> f(...)` examples with a literal value on the next line, as asserts."""
+    checks = []
+    lines = (prompt or "").splitlines()
+    for line, value in zip(lines, lines[1:], strict=False):
+        match = re.match(r"\s*>>>\s*(.+?)\s*$", line)
+        value = value.strip()
+        if not match or not value:
+            continue
+        call = match.group(1)
+        if not re.match(rf"{re.escape(entry_point)}\s*\(", call):
+            continue
+        try:
+            ast.literal_eval(value)
+            ast.parse(call, mode="eval")
+        except (ValueError, SyntaxError):
+            continue
+        checks.append(f"assert {call} == {value}")
+    return checks
+
+
 def has_signature(prompt: str) -> bool:
     return re.search(r"\bdef\s+\w+\s*\(", prompt or "") is not None
 
@@ -635,13 +780,16 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "num_candidates": 3,  # programs sampled before asking
         "num_probes": 8,  # inputs used to compare them
         "max_evidence": 3,  # disagreeing inputs shown to the question writer
-        "num_final": 2,  # programs sampled after the answer
+        "num_final": 3,  # programs sampled after the answer
         "use_answer_tests": True,  # pick the final program with asserts from the answer
         "clean_contradictions": True,  # no def line: drop statements that clash with the rest first
         "call_note": True,  # no def line: steer the question towards how the function is called
         "witness": False,  # ask with a concrete call and two possible results
         "evidence_quote": False,  # the question must point at words that are really in the task
         "keep_on_non_answer": True,  # a reply that settles nothing does not replace the programs we have
+        "readback_question": True,  # read the leading program's contract back, offer one alternative
+        "coding_rules": True,  # total functions, no assumed preconditions
+        "repairs": 2,  # rounds of fixing the chosen program against the checks it fails
         "time_limit": 200,  # seconds; past this, skip the optional steps (harness stops at 300)
     }
 
@@ -663,13 +811,16 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
 
     # llm helpers
 
-    def generate(self, env, problem, context=""):
-        prompt = (
-            CODE_TEMPLATE.replace("{entry_point}", problem["entry_point"])
+    def code_prompt(self, problem, context=""):
+        return (
+            CODE_TEMPLATE.replace("{rules}", CODE_RULES if self.config["coding_rules"] else "")
+            .replace("{entry_point}", problem["entry_point"])
             .replace("{prompt}", problem["prompt"])
             .replace("{context}", context)
         )
-        messages = [{"role": "user", "content": prompt}]
+
+    def generate(self, env, problem, context="", messages=None):
+        messages = messages or [{"role": "user", "content": self.code_prompt(problem, context)}]
         for _ in range(2):
             response = self.chat(env, messages)
             if not response:
@@ -788,6 +939,110 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         except LimitsExceededException:
             return question
         return parse_question(response, cut_compound=bool(call)) or question
+
+    @staticmethod
+    def leading(candidates, outputs):
+        """The program that crashes least on the probes, then the one most others agree with."""
+        groups = {}
+        for name in sorted(outputs, key=lambda n: int(n[1:])):
+            groups.setdefault(repr(outputs[name]), []).append(name)
+        if not groups:
+            return None, candidates[0]
+
+        def rank(group):
+            crashes = sum(str(v).startswith("ERR:") for v in outputs[group[0]])
+            return -crashes, len(group)
+
+        name = max(groups.values(), key=rank)[0]
+        return name, candidates[int(name[1:])]
+
+    @staticmethod
+    def example_call(problem, probes, outputs, name):
+        """An ordinary probe call and the output the program really gave, where the drafts split first."""
+        if not name or not probes:
+            return None
+        outs = outputs[name]
+        split = split_probes(outputs, len(outs))
+        order = split + [j for j in range(len(outs)) if j not in split]
+        order.sort(key=lambda j: edge_input(probes[j]))  # stable: ordinary calls first
+        for j in order:
+            value = str(outs[j])
+            call = f"{problem['entry_point']}({', '.join(repr(a) for a in probes[j])})"
+            if len(call) > 120 or len(value) > 80:
+                continue
+            try:
+                ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                continue  # a crash, a set, an iterator or an object: nothing the user can read
+            return call, value
+        return None
+
+    def readback_question(self, env, problem, candidates, probes, outputs, evidence):
+        """What the leading program does, read back with a real call; None to fall back."""
+        name, draft = self.leading(candidates, outputs)
+        if len(draft) > DRAFT_LIMIT:
+            return None
+        prompt = fill(
+            READBACK_TEMPLATE,
+            prompt=problem["prompt"],
+            draft=draft,
+            evidence=READBACK_NOTES.replace("{lines}", evidence) if evidence else "",
+            entry_point=problem["entry_point"],
+        )
+        fields = parse_fields(self.chat(env, prompt))
+        if fields.get("CLASH"):
+            question = tidy_question(fields["CLASH"])
+            if question and cites_task_call(question, problem["prompt"]):
+                return question
+        parts = [fields.get(k) for k in ("ARGS", "RETURNS", "RULE", "ALT")]
+        if not all(parts):
+            return None
+        example = self.example_call(problem, probes, outputs, name)
+        return render_readback(problem["entry_point"], *parts, example)
+
+    def check_runs(self, env, programs, checks):
+        """One 0/1 per check for each program, cut to the checks every program got through."""
+        sources = {f"c{i}": p for i, p in enumerate(programs)}
+        results = self.execute(
+            env,
+            CHECK_RUNNER,
+            sources=repr(sources),
+            tests=repr(checks),
+            deadline=EXEC_DEADLINE_SECONDS,
+        )
+        if not results or any(not isinstance(results.get(n), list) for n in sources):
+            return None
+        width = min(len(results[n]) for n in sources)
+        return [results[n][:width] for n in sources]
+
+    def repair(self, env, problem, context, chosen, finals, checks, probes):
+        """Fix the chosen program against checks some final passes; keep a fix only if it loses none."""
+        pool = list(dict.fromkeys([chosen, *finals]))
+        runs = self.check_runs(env, pool, checks)
+        if not runs:
+            return chosen
+        best = runs[0]
+        kept = [j for j in range(len(best)) if any(r[j] for r in runs)]
+        for _ in range(self.config["repairs"]):
+            failing = [checks[j] for j in kept if not best[j]]
+            if not failing or self.over_time():
+                break
+            messages = [
+                {"role": "user", "content": self.code_prompt(problem, context)},
+                {"role": "assistant", "content": f"```python\n{chosen}\n```"},
+                {"role": "user", "content": REPAIR_NOTE.replace("{failing}", "\n".join(failing))},
+            ]
+            fixed = self.generate(env, problem, context, messages=messages)
+            got = (self.check_runs(env, [fixed], checks) or [None])[0] if fixed else None
+            if not got or len(got) < len(best):
+                break
+            gained = sum(got[j] for j in kept) > sum(best[j] for j in kept)
+            if not gained or any(best[j] and not got[j] for j in kept):
+                break
+            if probes and fixed not in (self.healthy(env, problem, [chosen, fixed], probes) or []):
+                break  # it crashes more often on the probes
+            chosen, best = fixed, got
+        return chosen
 
     def clean_task(self, env, problem):
         response = self.chat(env, CLEAN_TEMPLATE.replace("{prompt}", problem["prompt"]))
@@ -915,7 +1170,13 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         stable = {n: o for n, o in outputs.items() if not nondeterministic(candidates[int(n[1:])])}
         evidence = self.evidence(problem, probes, stable) if stable else ""
 
-        question = self.write_question(env, problem, evidence) if env.can_ask() else None
+        question = None
+        if env.can_ask():
+            if self.config["readback_question"] and not self.over_time():
+                question = self.readback_question(
+                    env, problem, candidates, probes, stable, evidence
+                )
+            question = question or self.write_question(env, problem, evidence)
         answer = None
         if question and env.can_ask():
             try:
@@ -937,4 +1198,9 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
             tests = self.answer_tests(env, problem, question, answer)
         if self.over_time():
             probes = None
-        return self.select_final(env, problem, finals, tests, probes=probes, fallback=fallback)
+        chosen = self.select_final(env, problem, finals, tests, probes=probes, fallback=fallback)
+        if self.config["repairs"] and question and answer and not self.over_time():
+            checks = tests + stated_checks(problem["prompt"], problem["entry_point"])
+            if checks:
+                chosen = self.repair(env, problem, context, chosen, finals, checks, probes)
+        return chosen
