@@ -14,18 +14,15 @@ is picked with asserts written from the answer.
 Tasks that show no def line are handled a little differently: statements that
 cannot hold together with the rest are dropped first, and the question is
 steered towards how the function is called, since that is what such tasks most
-often leave open. Tasks with a def line go through the plain path.
+often leave open. Tasks with a def line keep their text as given.
 
 A reply that settles nothing ("not specified", "cannot answer") is not used to
 rewrite the program; the programs from before the question are kept instead.
 
 On tasks with a def line the question reads back what the leading program
 does: its arguments, its result, its rule and one ordinary call with the output
-it really gave, and asks whether that is what the user wants. If the user says
-yes, that call becomes a check for the final program. When an example in the
-task disagrees with the text, the question asks about that example instead.
-Before that, a sentence that cannot hold together with the rest may be deleted,
-whole sentences only and never an example or the signature.
+it really gave, and asks whether that is what the user wants. When an example in
+the task disagrees with the text, the question asks about that example instead.
 
 Team: RankOne
 Team Members: Md Zahidul Haque
@@ -35,7 +32,6 @@ Main Contact: mhaque@wm.edu
 from __future__ import annotations
 
 import ast
-import difflib
 import json
 import math
 import re
@@ -170,23 +166,6 @@ different results here:
 """
 
 DRAFT_LIMIT = 4000
-
-DELETE_TEMPLATE = """
-Below is a programming task. Some tasks in this collection had a sentence added that cannot hold
-together with the rest: an impossible limit such as O(1) time or "no loops" for a task that has to
-look at every element, a demand to return numbers or booleans as strings, a demand to also accept a
-different kind of input, or a closing sentence that undoes the main one.
-
-If the task has such a sentence, return the task with just that sentence deleted. Delete whole
-sentences only; keep the signature, every example and every other sentence exactly as written, and
-add nothing. Vague or missing details and choices the task leaves open are not clashes. If nothing
-clashes, reply with the single word UNCHANGED. Most tasks are like that.
-
-Task:
-{prompt}
-
-Reply with UNCHANGED, or with the task inside ```text and ```.
-""".strip()
 
 ANSWER_CONTEXT = """
 The user was asked: {question}
@@ -688,69 +667,6 @@ READBACK_CLOSE = (
     " Is that what you intend, or should it behave differently or return a different format?"
 )
 
-CONFIRM = r"^\W*(yes|yep|correct|exactly|right|that(?:'s| is) (?:right|correct))\b"
-
-CONFIRM_TEMPLATE = """
-We showed the user what our program does, including this call and its result:
-{call} returns {value}
-The user replied:
-{answer}
-Does the reply accept that exact result for that call, with nothing about it changed? Reply with one
-word: YES or NO.
-""".strip()
-
-
-def says_yes(answer: str | None) -> bool:
-    """The reply opens with a yes; it may still change something, so the call is checked next."""
-    return bool(re.match(CONFIRM, (answer or "").lower()))
-
-
-def accept_deletion(original: str, edited: str | None, entry_point: str) -> str | None:
-    """The edited task if it only deletes whole sentences, never an example or the signature."""
-    text = (edited or "").strip()
-    if not text or text.upper().startswith("UNCHANGED"):
-        return None
-    token = r"\w+|[^\w\s]"  # words and single marks, so a sentence can end next to quotes
-    spans = list(re.finditer(token, original))
-    words = re.findall(token, text)
-    if not words or len(words) >= len(spans) or len(words) < 0.6 * len(spans):
-        return None
-    tokens = [m.group() for m in spans]
-    matcher = difflib.SequenceMatcher(None, tokens, words, autojunk=False)
-    for tag, i1, i2, _, _ in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        if tag != "delete":
-            return None
-        lined_up = shifts(tokens, i1, i2)
-        if not any(whole_sentences(original, spans, a, b, entry_point) for a, b in lined_up):
-            return None
-    return text
-
-
-def shifts(tokens: list[str], i1: int, i2: int):
-    """The same deletion lined up differently, e.g. which of two equal words a deleted sentence started at."""
-    yield i1, i2
-    a, b = i1, i2
-    while a > 0 and tokens[a - 1] == tokens[b - 1]:
-        a, b = a - 1, b - 1
-        yield a, b
-    a, b = i1, i2
-    while b < len(tokens) and tokens[b] == tokens[a]:
-        a, b = a + 1, b + 1
-        yield a, b
-
-
-def whole_sentences(original: str, spans, a: int, b: int, entry_point: str) -> bool:
-    """Tokens a..b of the original are whole sentences and no example or signature."""
-    start, end = spans[a].start(), spans[b - 1].end()
-    cut, before, after = original[start:end], original[:start].rstrip(" \t"), original[end:]
-    if ">>>" in cut or "def " in cut or f"{entry_point}(" in cut:
-        return False
-    if before and not before.endswith((".", "!", "?", ":", "\n", '"', "'")):
-        return False  # starts inside a sentence
-    return cut.endswith((".", "!", "?")) or after.startswith("\n") or not after.strip()
-
 
 def has_signature(prompt: str) -> bool:
     return re.search(r"\bdef\s+\w+\s*\(", prompt or "") is not None
@@ -835,14 +751,11 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "keep_on_non_answer": True,  # a reply that settles nothing does not replace the programs we have
         "readback_question": True,  # def line: read the leading program back and ask if it is meant
         "coding_rules": True,  # total functions, no assumed preconditions
-        "confirm_check": True,  # a confirmed read-back call becomes a check for the final program
-        "delete_clashes": True,  # def line: delete a sentence that clashes with the rest first
         "time_limit": 200,  # seconds; past this, skip the optional steps (harness stops at 300)
     }
 
     # per-task state, reset in run(); the repo validator rejects underscore attributes
     kept = ()  # programs that came back clean during the current task
-    shown = None  # the read-back's call, its output and the program that gave it
     deadline = math.inf
 
     def over_time(self):
@@ -1044,22 +957,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         if not all(parts):
             return None
         example = self.example_call(problem, probes, outputs, name)
-        if example:
-            self.shown = (*example, draft)
         return render_readback(problem["entry_point"], *parts, example)
-
-    def confirmed(self, env, answer):
-        """The user accepted the read-back's call and result as they were."""
-        if not says_yes(answer) or self.over_time():
-            return False
-        call, value, _ = self.shown
-        prompt = fill(CONFIRM_TEMPLATE, call=call, value=value, answer=answer)
-        return (self.chat(env, prompt) or "").strip().upper().startswith("YES")
-
-    def delete_clashes(self, env, problem):
-        response = self.chat(env, DELETE_TEMPLATE.replace("{prompt}", problem["prompt"]))
-        edited = accept_deletion(problem["prompt"], extract_text(response), problem["entry_point"])
-        return {**problem, "prompt": edited} if edited else problem
 
     def clean_task(self, env, problem):
         response = self.chat(env, CLEAN_TEMPLATE.replace("{prompt}", problem["prompt"]))
@@ -1154,7 +1052,6 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
 
     def run(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
         self.kept = []
-        self.shown = None
         self.deadline = time.monotonic() + self.config["time_limit"]
         try:
             return self.solve(env, problem)
@@ -1179,8 +1076,6 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
     def solve(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
         if self.config["clean_contradictions"] and not has_signature(problem["prompt"]):
             problem = self.clean_task(env, problem)
-        elif self.config["delete_clashes"] and has_signature(problem["prompt"]):
-            problem = self.delete_clashes(env, problem)
         candidates = self.sample(env, problem, self.config["num_candidates"])
         if not candidates:
             return ""
@@ -1217,11 +1112,6 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         tests = []
         if self.config["use_answer_tests"] and question and answer and not self.over_time():
             tests = self.answer_tests(env, problem, question, answer)
-        if self.config["confirm_check"] and self.shown and self.confirmed(env, answer):
-            # the user said yes to this call and output, and to the program that gave them
-            call, value, draft = self.shown
-            tests = [*tests, f"assert {call} == {value}"]
-            finals = [*finals, draft]
         if self.over_time():
             probes = None
         return self.select_final(env, problem, finals, tests, probes=probes, fallback=fallback)
