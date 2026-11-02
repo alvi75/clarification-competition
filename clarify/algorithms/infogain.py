@@ -25,7 +25,7 @@ the text, the question asks about that example instead. If no read-back comes
 out, a task without a def line is asked how the function is called.
 
 Team: RankOne
-Team Members: Md Zahidul Haque
+Team Members: Md Zahidul Haque, Saima Afrin, Antonio Mastropaolo
 Main Contact: mhaque@wm.edu
 """
 
