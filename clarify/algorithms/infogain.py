@@ -12,17 +12,17 @@ that is passed along as a hint about where the task is open. The final program
 is picked with asserts written from the answer.
 
 Tasks that show no def line are handled a little differently: statements that
-cannot hold together with the rest are dropped first, and the question is
-steered towards how the function is called, since that is what such tasks most
-often leave open. Tasks with a def line keep their text as given.
+cannot hold together with the rest are dropped first. Tasks with a def line keep
+their text as given.
 
 A reply that settles nothing ("not specified", "cannot answer") is not used to
 rewrite the program; the programs from before the question are kept instead.
 
-On tasks with a def line the question reads back what the leading program
-does: its arguments, its result, its rule and one ordinary call with the output
-it really gave, and asks whether that is what the user wants. When an example in
-the task disagrees with the text, the question asks about that example instead.
+The question reads back what the leading program does: its arguments, its
+result, its rule and, when a probe call ran cleanly, one ordinary call with the
+output it gave, and asks whether that is what the user wants. When an example in the task disagrees with
+the text, the question asks about that example instead. If no read-back comes
+out, a task without a def line is asked how the function is called.
 
 Team: RankOne
 Team Members: Md Zahidul Haque
@@ -745,11 +745,12 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "num_final": 2,  # programs sampled after the answer
         "use_answer_tests": True,  # pick the final program with asserts from the answer
         "clean_contradictions": True,  # no def line: drop statements that clash with the rest first
-        "call_note": True,  # no def line: steer the question towards how the function is called
+        "call_note": True,  # no def line, no read-back: ask how the function is called
         "witness": False,  # ask with a concrete call and two possible results
         "evidence_quote": False,  # the question must point at words that are really in the task
         "keep_on_non_answer": True,  # a reply that settles nothing does not replace the programs we have
-        "readback_question": True,  # def line: read the leading program back and ask if it is meant
+        "readback_question": True,  # read the leading program back and ask if it is meant
+        "readback_without_def": True,  # no def line: the read-back too, instead of the call question
         "coding_rules": True,  # total functions, no assumed preconditions
         "time_limit": 200,  # seconds; past this, skip the optional steps (harness stops at 300)
     }
@@ -1087,7 +1088,9 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
 
         question = None
         if env.can_ask():
-            readback = self.config["readback_question"] and has_signature(problem["prompt"])
+            readback = self.config["readback_question"] and (
+                has_signature(problem["prompt"]) or self.config["readback_without_def"]
+            )
             if readback and not self.over_time():
                 question = self.readback_question(
                     env, problem, candidates, probes, stable, evidence
