@@ -28,6 +28,9 @@ Tasks that need files, the network or the shell may import anything; our own
 runs then block the network and evalplus. Tasks with DataFrames, arrays, dates
 or a class get probes that build such objects, and results with no literal form
 are read back by type and shape. A plain yes puts the read-back program first.
+Without a def line, a call with more positional arguments than the function
+takes drops a length argument; else a one-argument function gets them packed
+into a tuple, and any other drops the trailing ones (issue #46).
 The smaller settings are listed in DEFAULT_CONFIG.
 
 Team: RankOne
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import ast
 import json
+import keyword
 import math
 import re
 import time
@@ -439,6 +443,67 @@ for _t in _TESTS:
 EXEC_DEADLINE_SECONDS = 15
 
 # block network and evalplus on open-code tasks
+CALL_ADAPTER = """
+
+
+def _infogain_fit_calls(fn, name):
+    import builtins as b
+    import inspect
+
+    if not inspect.isfunction(fn):
+        return fn
+    try:
+        params = b.list(inspect.signature(fn, follow_wrapped=False).parameters.values())
+    except Exception:
+        return fn
+    if not params or b.any(p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params):
+        return fn
+    most = b.len(params)
+    scope = fn.__globals__
+
+    def fit(args):
+        args = b.list(args)
+        while b.len(args) > most:
+            sizes = b.set()
+            for a in args:
+                if not b.isinstance(a, (b.bool, b.int)):
+                    try:
+                        sizes.add(b.len(a))
+                    except Exception:
+                        pass
+            for i, a in b.enumerate(args):
+                if b.type(a) is b.int and a in sizes:
+                    del args[i]
+                    break
+            else:
+                if most == 1:
+                    return [b.tuple(args)]
+                del args[most:]
+        return args
+
+    def call(*args, **kwargs):
+        if not kwargs and b.len(args) > most:
+            args = fit(args)
+        if scope.get(name) is not call:
+            return fn(*args, **kwargs)
+        scope[name] = fn  # recursion goes straight to fn
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if scope.get(name) is fn:
+                scope[name] = call
+
+    call.__name__, call.__doc__, call.__wrapped__ = fn.__name__, fn.__doc__, fn
+    return call
+
+
+try:
+    ENTRY = _infogain_fit_calls(ENTRY, "ENTRY")
+except Exception:
+    pass
+del _infogain_fit_calls
+"""
+
 GUARD = """import socket
 
 
@@ -1309,6 +1374,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "bind_answer_contract": False,  # "it takes N arguments" in the answer ranks the finals
         "confirmed_draft": True,  # trust a plain yes, ignore a counter-question
         "non_answer_brackets": True,  # ignore "(not specified)" asides
+        "call_adapter": True,  # no def line: extra positional args drop a length, else pack or drop the trailing ones
     }
 
     # per-task state, reset in run(); the repo validator rejects underscore attributes
@@ -1688,13 +1754,33 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         self.spare_runs = 0
         self.deadline = time.monotonic() + self.config["time_limit"]
         try:
-            return self.solve(env, problem)
+            code = self.solve(env, problem)
         except LimitsExceededException:
             # out of model budget: the last program that came back clean beats nothing
-            return self.kept[-1] if self.kept else ""
+            code = self.kept[-1] if self.kept else ""
         except Exception:
             # anything else (an api error, a reply the harness cannot print): same fallback
-            return self.kept[-1] if self.kept else ""
+            code = self.kept[-1] if self.kept else ""
+        return self.fit_calls(code, problem)
+
+    def fit_calls(self, code, problem):
+        """Append CALL_ADAPTER to a program for a task without a def line."""
+        if not self.config["call_adapter"]:
+            return code
+        try:
+            entry = problem.get("entry_point")
+            if not (
+                isinstance(entry, str) and entry.isidentifier() and not keyword.iskeyword(entry)
+            ):
+                return code
+            if not (code and code.strip()) or "```" in code or has_signature(problem.get("prompt")):
+                return code
+            fitted = code.rstrip() + CALL_ADAPTER.replace("ENTRY", entry)
+            ast.parse(code)
+            ast.parse(fitted)
+        except Exception:
+            return code
+        return fitted
 
     def sample(self, env, problem, count, context=""):
         """Up to `count` programs; once over time, stop after the first one."""
