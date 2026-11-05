@@ -28,9 +28,8 @@ Tasks that need files, the network or the shell may import anything; our own
 runs then block the network and evalplus. Tasks with DataFrames, arrays, dates
 or a class get probes that build such objects, and results with no literal form
 are read back by type and shape. A plain yes puts the read-back program first.
-Without a def line, a call with more positional arguments than the function
-takes drops a length argument; else a one-argument function gets them packed
-into a tuple, and any other drops the trailing ones (issue #46).
+Without a def line, calls with too many arguments are fitted to the function
+(CALL_ADAPTER, see issue #46).
 The smaller settings are listed in DEFAULT_CONFIG.
 
 Team: RankOne
@@ -1374,7 +1373,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "bind_answer_contract": False,  # "it takes N arguments" in the answer ranks the finals
         "confirmed_draft": True,  # trust a plain yes, ignore a counter-question
         "non_answer_brackets": True,  # ignore "(not specified)" asides
-        "call_adapter": True,  # no def line: extra positional args drop a length, else pack or drop the trailing ones
+        "call_adapter": True,  # fit calls with too many args when there is no def line
     }
 
     # per-task state, reset in run(); the repo validator rejects underscore attributes
