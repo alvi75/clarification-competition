@@ -24,6 +24,12 @@ output it gave, and asks whether that is what the user wants. When an example in
 the text, the question asks about that example instead. If no read-back comes
 out, a task without a def line is asked how the function is called.
 
+Tasks that need files, the network or the shell may import anything; our own
+runs then block the network and evalplus. Tasks with DataFrames, arrays, dates
+or a class get probes that build such objects, and results with no literal form
+are read back by type and shape. A plain yes puts the read-back program first.
+The smaller settings are listed in DEFAULT_CONFIG.
+
 Team: RankOne
 Team Members: Md Zahidul Haque, Saima Afrin, Antonio Mastropaolo
 Main Contact: mhaque@wm.edu
@@ -57,6 +63,8 @@ exactly that name, even if the task text calls it something else. Only define it
 {rules}Put the code in ```python and ```.
 """.strip()
 
+NO_IO_SENTENCE = " Do not access files, the network or the shell, and do not use eval or exec."
+
 CODE_RULES = """Make it return a result for every input of the kind the task describes: do not add checks that
 raise errors unless the task asks for them, and do not assume the input is sorted, distinct or
 non-empty unless the task says so. Accept a list or a tuple wherever a sequence is passed. Where the
@@ -72,6 +80,14 @@ between plausible interpretations of the task (edge cases, boundary values, unus
 Return ONE Python literal: a list where each element is a list of positional arguments.
 Enclose it in ```python and ```. Use only literals (no function calls, no imports).
 """.strip()
+
+PROBE_LITERALS = """Return ONE Python literal: a list where each element is a list of positional arguments.
+Enclose it in ```python and ```. Use only literals (no function calls, no imports)."""
+
+PROBE_EXPRESSIONS = """Return ONE Python list where each element is a list of positional arguments.
+Enclose it in ```python and ```. Use literals; an argument that has no literal form (a DataFrame, an
+array, a date, an object of a class from the task) may be one constructor call such as
+pd.DataFrame({...}) or np.array([...]). No other calls, no lambdas, no imports."""
 
 QUESTION_TEMPLATE = """
 Task (the tests call `{entry_point}`):
@@ -101,6 +117,12 @@ so never reply that nothing is open.
 {quote}End with one line of the form
 QUESTION: <your question>
 """.strip()
+
+SKIP_ERRORS = """skip input validation, error handling and
+performance: the tests use ordinary valid inputs."""
+
+ASK_ERRORS = """skip performance. The task mentions errors, so
+which inputs raise and what is raised can be the open point if the text leaves it unclear."""
 
 PLAIN_STYLE = "Do not\nask for test cases or for the output of a particular input."
 
@@ -159,6 +181,10 @@ RULE: <what it computes, in one sentence and in the task's own terms; where the 
 Keep each line under 20 words, and do not name libraries or helper functions.
 """.strip()
 
+RULE_TAIL = "say what this program does there>"
+
+RULE_ERRORS = "say what this program does there; if it raises an error, say on which inputs>"
+
 READBACK_NOTES = """
 Notes (the user has not seen these): drafts of the program were run on the same inputs and gave
 different results here:
@@ -172,6 +198,11 @@ The user was asked: {question}
 They answered: {answer}
 The answer is the final word on that point. If it disagrees with the task text, go with the answer;
 everything else follows the task.
+"""
+
+CONTRACT_NOTE = """
+The user's answer fixes the call: `{entry_point}` takes {count} argument(s). Define it with exactly
+that many parameters.
 """
 
 ANSWER_TESTS_TEMPLATE = """
@@ -310,6 +341,37 @@ for _args in _PROBES:
     _emit(_out)
 """
 
+# expression probes are built in each program's namespace, fresh for every call
+EXPR_RUNNER = (
+    RUNNER.replace(
+        "_ENTRY = {entry!r}\n",
+        """_ENTRY = {entry!r}
+_MODULES = {modules}
+_base = {{}}
+for _alias, _module in _MODULES.items():
+    try:
+        import importlib
+        _base[_alias] = importlib.import_module(_module)
+    except BaseException:
+        pass
+_spaces = {{}}
+
+
+def _make(args, name):
+    if isinstance(args, str):
+        return eval(args, {{**_spaces[name], **_base, "nan": float("nan"), "inf": float("inf")}})
+    return copy.deepcopy(args)
+
+
+""",
+    )
+    .replace(
+        "        _fns[_name] = _ns[_ENTRY]\n",
+        "        _fns[_name] = _ns[_ENTRY]\n        _spaces[_name] = _ns\n",
+    )
+    .replace("_fn(*copy.deepcopy(_args))", "_fn(*_make(_args, _name))")
+)
+
 TEST_RUNNER = r"""
 import copy, io, itertools, json, signal, sys, time
 from math import inf, nan
@@ -375,6 +437,35 @@ for _t in _TESTS:
 
 # the sandbox kills the process at 30s, so stop early
 EXEC_DEADLINE_SECONDS = 15
+
+# block network and evalplus on open-code tasks
+GUARD = """import socket
+
+
+def _no_network(*args, **kwargs):
+    raise OSError("network access is blocked")
+
+
+socket.create_connection = socket.getaddrinfo = _no_network
+socket.socket.connect = socket.socket.connect_ex = socket.socket.sendto = _no_network
+sys.modules["evalplus"] = None
+
+
+"""
+
+
+def died(results) -> bool:
+    """True if the batch run returned nothing usable."""
+    if results is None:
+        return True
+    lists = [v for v in results.values() if isinstance(v, list)]
+    return bool(lists) and not any(lists)
+
+
+def guarded(template: str) -> str:
+    return template.replace(
+        "class _Timeout(BaseException):", GUARD + "class _Timeout(BaseException):"
+    )
 
 
 def extract_block(text: str, lang: str) -> str | None:
@@ -448,9 +539,10 @@ UNSAFE_MODULES = {
     "builtins",
 }
 UNSAFE_CALLS = {"eval", "exec", "compile", "__import__", "open", "input", "breakpoint"}
+ALWAYS_BANNED = {"evalplus"}
 
 
-def unsafe_reason(code: str) -> str | None:
+def unsafe_reason(code: str, modules=UNSAFE_MODULES, calls=UNSAFE_CALLS) -> str | None:
     """Why generated code touches files, network, shell or dynamic execution; None if it doesn't."""
     try:
         tree = ast.parse(code)
@@ -464,12 +556,44 @@ def unsafe_reason(code: str) -> str | None:
         else:
             names = []
         for name in names:
-            if name.split(".")[0] in UNSAFE_MODULES:
+            if name.split(".")[0] in modules:
                 return f"imports {name}"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in UNSAFE_CALLS:
+            if node.func.id in calls:
                 return f"calls {node.func.id}()"
     return None
+
+
+IO_ACTION = (
+    r"\b(?:read|reads|reading|open|opens|opened|opening|save|saves|saved|saving|load|loads|loaded"
+    r"|loading|download|downloads|downloaded|downloading|fetch|fetches|fetched|fetching|request"
+    r"|requests|requested|requesting|connect|connects|connected|connecting|walk|walks|walking|delete"
+    r"|deletes|deleted|deleting|create|creates|created|creating)\b"
+    r"|\b(?:write|writes|writing)\b(?!\s+(?:an?\s+)?(?:python\s+)?(?:function|program|method|class))"
+    r"|(?<!\ba\s)(?<!\bthe\s)\b(?:list|lists|listing)\b"
+)
+IO_OBJECT = (
+    r"\b(?:files?|file\s*paths?|director(?:y|ies)|folders?|urls?|https?|web\s*pages?|network"
+    r"|sockets?|environment)\b"
+)
+IO_MODULES = {"os", "subprocess", "requests", "urllib", "shutil", "socket", "pathlib"}
+OPEN_CODE = re.compile(
+    rf"(?:{IO_ACTION})[^.\n]{{0,25}}?{IO_OBJECT}"
+    r"|\b(?:os|subprocess|requests|urllib|shutil|socket|pathlib)\.\w"
+    r"|\bshell\s+(?:commands?|scripts?)\b"
+    r"|\b(?:eval|exec)\s*\(|\b(?:use|using|call|calling)\s+(?:the\s+)?(?:built-?in\s+)?(?:eval|exec)\b",
+    flags=re.IGNORECASE,
+)
+NAMED_MODULES = r"^\s*(?:import|from)\s+([\w.]+)|^\s*[-*]\s*([\w.]+)\s*$"
+
+
+def needs_any_code(prompt: str) -> bool:
+    """Check if the task needs files, network, shell or eval."""
+    text = prompt or ""
+    if OPEN_CODE.search(text):
+        return True
+    named = re.findall(NAMED_MODULES, text, flags=re.MULTILINE)
+    return any(n.split(".")[0] in IO_MODULES for group in named for n in group if n)
 
 
 RANDOM_MODULES = {"random", "secrets", "uuid", "time"}
@@ -532,8 +656,54 @@ NON_ANSWER = (
 )
 
 
-def says_nothing(answer: str | None) -> bool:
-    return bool(re.search(NON_ANSWER, answer or "", flags=re.IGNORECASE))
+def says_nothing(answer: str | None, skip_brackets: bool = False) -> bool:
+    text = answer or ""
+    if skip_brackets:
+        # a bracketed aside does not void the answer; all brackets is kept whole
+        outside = unbracket(text)
+        text = outside if re.search(r"\w", outside) else text
+    return bool(re.search(NON_ANSWER, text, flags=re.IGNORECASE))
+
+
+def unbracket(text: str) -> str:
+    while True:
+        stripped = re.sub(r"\([^()]*\)", " ", text)
+        if stripped == text:
+            return text
+        text = stripped
+
+
+ASK_ONLY = (
+    r"(?:(?:sorry|pardon(?: me)?|excuse me)[,.!]?\s*)?"
+    r"(?:what do you mean(?: by [^?]{1,60})?|which one(?: do you mean)?"
+    r"|(?:could|can) you (?:please )?(?:clarify|rephrase|explain)(?: [^?]{1,60})?"
+    r"|sorry|pardon(?: me)?)\s*\?"
+)
+
+
+def asks_back(answer: str | None) -> bool:
+    """Check if the reply only asks to clarify."""
+    text = " ".join((answer or "").split()).strip("\"'*` ")
+    return (
+        bool(text) and re.fullmatch(rf"(?:{ASK_ONLY}\s*)+", text, flags=re.IGNORECASE) is not None
+    )
+
+
+CONFIRM = r"^\W*(?:yes|correct|that'?s (?:right|correct)|that is (?:right|correct))\b"
+
+CORRECTION = (
+    r"\b(?:but|however|instead|should|must|rather|not|except|unless|although|though|also|plus"
+    r"|additionally|as\s+well\s+as|and\s+returns?)\b|n't\b"
+)
+
+
+def confirms(answer: str | None) -> bool:
+    """Check if the reply is a plain yes."""
+    text = (answer or "").replace("\u2019", "'")
+    return bool(
+        re.match(CONFIRM, text, flags=re.IGNORECASE)
+        and not re.search(CORRECTION, text, flags=re.IGNORECASE)
+    )
 
 
 def unprintable(error: Exception) -> bool:
@@ -672,6 +842,29 @@ def has_signature(prompt: str) -> bool:
     return re.search(r"\bdef\s+\w+\s*\(", prompt or "") is not None
 
 
+def contract_known(prompt: str, entry_point: str) -> bool:
+    """Check if the task shows how the entry point is called."""
+    name = re.escape(entry_point)
+    shown = (
+        r"\bdef\s+\w+\s*\(",
+        rf"^\s*class\s+{name}\s*[:(]",
+        rf"\b(?i:class\s+(?:named|called))\s+[`'\"]?{name}\b",
+        rf"\b{name}\(\s*[^\s)]",
+    )
+    return any(re.search(p, prompt or "", flags=re.MULTILINE) for p in shown)
+
+
+ERRORS = (
+    r"\b\w+(?:Error|Exception)\b"
+    r"|(?i:\brais(?:e|es|ed)\s+an?\b(?![^.\n]*\bpower\b)|\bthrows?\b|\ban\s+exception\b)"
+)
+
+
+def mentions_errors(prompt: str) -> bool:
+    """Check if the task mentions errors."""
+    return re.search(ERRORS, prompt or "") is not None
+
+
 def extract_text(text: str) -> str | None:
     """A ```text block up to its last fence, so fences inside the task do not cut it short."""
     match = re.search(r"```text\s*\n(.*)```", text or "", flags=re.DOTALL)
@@ -737,6 +930,359 @@ def clip(text: str, size: int = 160) -> str:
     return text if len(text) <= size else text[: size - 3] + "..."
 
 
+# type summaries
+
+
+def is_literal(value: str) -> bool:
+    try:
+        ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return False
+    return True
+
+
+def loose_literal(text: str, loose: bool = True):
+    """literal_eval with nan and inf as None (unless loose is False)."""
+    if loose:
+        text = re.sub(r"(?<![\w'\"])-?(?:nan|inf)\b", "None", text)
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return None
+
+
+def article(name: str) -> str:
+    return ("an " if name[:1].lower() in "aeiou" else "a ") + name
+
+
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+def array_shape(items) -> tuple:
+    if not isinstance(items, list):
+        return ()
+    inner = {array_shape(x) for x in items}
+    return (len(items), *inner.pop()) if len(inner) == 1 else (len(items),)
+
+
+def leaves(items):
+    if isinstance(items, list):
+        for x in items:
+            yield from leaves(x)
+    else:
+        yield items
+
+
+KINDS = {bool: "booleans", int: "integers", float: "floats", type(None): "floats", str: "strings"}
+
+
+def array_summary(name: str, payload: str) -> str:
+    noun = "an array" if name == "ndarray" else article(name)
+    items = loose_literal(payload)
+    if not isinstance(items, list):
+        return noun
+    kinds = {KINDS.get(type(x)) for x in leaves(items)}
+    kind = f" of {next(iter(kinds))}" if len(kinds) == 1 and None not in kinds else ""
+    return f"{noun} of shape {array_shape(items)}{kind}"
+
+
+def frame_summary(name: str, payload: str) -> str:
+    text, parts = article(name), loose_literal(payload)
+    if not isinstance(parts, dict):
+        return text
+    index, columns = parts.get("index"), parts.get("columns")
+    rows = f" with {plural(len(index), 'row')}" if isinstance(index, list) else ""
+    if not isinstance(columns, list):
+        return text + rows
+    joint = " and" if rows else " with"
+    full = f"{text}{rows}{joint} columns {columns!r}"
+    return full if len(full) <= 80 else f"{text}{rows}{joint} {plural(len(columns), 'column')}"
+
+
+def object_summary(name: str, state: str | None) -> str:
+    fields = loose_literal(state, loose=False) if state else None
+    if not isinstance(fields, dict):
+        return article(name) + " object"
+    # public attributes only
+    pairs = [f"{k}={v!r}" for k, v in fields.items() if isinstance(k, str) and k[:1] != "_"]
+    return f"{article(name)} with {', '.join(pairs)}" if pairs else article(name) + " object"
+
+
+def counted(prefix: str, payload: str, word: str) -> str:
+    items = loose_literal(payload)
+    return f"{prefix} of {plural(len(items), word)}" if isinstance(items, list) else prefix
+
+
+def type_summary(value: str) -> str | None:
+    """Describe a non-literal result by type and shape."""
+    if value in ("nan", "inf", "-inf"):
+        return value
+    flags = re.DOTALL
+    if match := re.fullmatch(r"([A-Za-z_]\w*):(.*)", value, flags=flags):
+        name, payload = match.groups()
+        if payload.startswith("{"):
+            text = frame_summary(name, payload)
+        elif name == "Series":
+            text = counted("a Series", payload, "value")
+        elif payload.startswith("["):
+            text = array_summary(name, payload)
+        else:
+            return None
+    elif match := re.fullmatch(r"(set|frozenset)\{(.*)\}", value, flags=flags):
+        text = counted(f"a {match.group(1)}", f"[{match.group(2)}]", "item")
+    elif match := re.fullmatch(r"iter(\[.*\])", value, flags=flags):
+        text = counted("an iterator", match.group(1), "item")
+    elif match := re.fullmatch(r"([A-Za-z_][\w.]*)(?:\(.*\)|(\{.*\}))?", value, flags=flags):
+        text = object_summary(match.group(1).rsplit(".", 1)[-1], match.group(2))
+    else:
+        return None
+    return clip(text, 80)
+
+
+# expression probes
+
+
+PROBE_MODULES = {
+    "pd": "pandas",
+    "pandas": "pandas",
+    "np": "numpy",
+    "numpy": "numpy",
+    "datetime": "datetime",
+    "collections": "collections",
+    "decimal": "decimal",
+    "fractions": "fractions",
+    "math": "math",
+}
+PROBE_NODES = (
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.Call,
+    ast.Attribute,
+    ast.keyword,
+    ast.UnaryOp,
+    ast.UAdd,
+    ast.USub,
+    ast.BinOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+)
+REFLECTION = {"sys", "getattr", "setattr", "delattr", "globals", "locals", "vars"}
+PROBE_BLOCKED = UNSAFE_CALLS | UNSAFE_MODULES | REFLECTION
+ARRAY_MODULES = {"pd", "pandas", "np", "numpy"}
+CONSTRUCTORS = {
+    "DataFrame",
+    "Series",
+    "array",
+    "arange",
+    "zeros",
+    "ones",
+    "full",
+    "to_datetime",
+    "Timestamp",
+    "date_range",
+    "NaT",
+    "nan",
+    "inf",
+}
+TYPED_TASK = (
+    r"(?i:\bpandas\b|\bnumpy\b|\bdataframes?\b|\bndarrays?\b|\bnp\.\w|\bpd\.\w|\bdtype\b"
+    r"|\btensors?\b|\bdatetime\b|\btimestamps?\b|\bdate\s+objects?\b)|\bSeries\b"
+)
+
+
+def typed_task(prompt: str, entry_point: str) -> bool:
+    """Check if the task uses DataFrames, arrays, dates or a class."""
+    text = prompt or ""
+    if re.search(TYPED_TASK, text):
+        return True
+    return re.search(rf"^\s*class\s+{re.escape(entry_point)}\s*[:(]", text, flags=re.M) is not None
+
+
+def safe_probe(node: ast.AST) -> bool:
+    """Allow only literals and constructor calls."""
+    for n in ast.walk(node):
+        if not isinstance(n, PROBE_NODES):
+            return False
+        if isinstance(n, ast.Name) and (n.id.startswith("__") or n.id in PROBE_BLOCKED):
+            return False
+        if isinstance(n, ast.Attribute) and (
+            n.attr.startswith("__") or not isinstance(n.value, ast.Name)
+        ):
+            return False
+        if isinstance(n, ast.Attribute) and n.value.id in ARRAY_MODULES:
+            if n.attr not in CONSTRUCTORS:
+                return False
+        if isinstance(n, ast.keyword) and (n.arg is None or n.arg.startswith("__")):
+            return False
+        if isinstance(n, ast.Dict) and None in n.keys:
+            return False
+    return True
+
+
+def expression_probes(block: str) -> list | None:
+    """Parse a probe list that has constructor calls."""
+    try:
+        tree = ast.parse(block.strip(), mode="eval")
+    except SyntaxError:
+        return None
+    if not isinstance(tree.body, ast.List):
+        return None
+    probes = []
+    for node in tree.body.elts:
+        try:
+            value = ast.literal_eval(node)
+        except (ValueError, TypeError, SyntaxError):
+            if safe_probe(node):
+                args = node.elts if isinstance(node, ast.List | ast.Tuple) else [node]
+                probes.append("[" + ", ".join(ast.unparse(a) for a in args) + "]")
+            continue
+        probes.append(value if isinstance(value, list | tuple) else [value])
+    return probes or None
+
+
+def probe_runner(probes) -> tuple[str, dict[str, str]]:
+    """Pick the runner for literal or expression probes."""
+    sources = [p for p in probes if isinstance(p, str)]
+    if not sources:
+        return RUNNER, {}
+    trees = [ast.parse(p, mode="eval") for p in sources]
+    names = {n.id for t in trees for n in ast.walk(t) if isinstance(n, ast.Name)}
+    return EXPR_RUNNER, {"modules": repr({k: v for k, v in PROBE_MODULES.items() if k in names})}
+
+
+def edge_probe(probe) -> bool:
+    """edge_input for expression probes too."""
+    if not isinstance(probe, str):
+        return edge_input(probe)
+    nodes = ast.parse(probe, mode="eval").body.elts
+    values = []
+    for node in nodes:
+        if isinstance(node, ast.Call) and not node.args and not node.keywords:
+            return True  # empty constructor, e.g. pd.DataFrame()
+        inner = (
+            [*node.args, *(k.value for k in node.keywords)]
+            if isinstance(node, ast.Call)
+            else [node]
+        )
+        for n in inner:
+            try:
+                values.append(ast.literal_eval(n))
+            except (ValueError, TypeError, SyntaxError):
+                continue
+    return not nodes or (bool(values) and edge_input(values))
+
+
+def call_text(entry_point: str, probe) -> str:
+    if isinstance(probe, str):
+        return f"{entry_point}({probe[1:-1]})"
+    return f"{entry_point}({', '.join(repr(a) for a in probe)})"
+
+
+# arity from the answer
+
+NUMBERS = {
+    "no": 0,
+    "zero": 0,
+    "one": 1,
+    "a single": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+COUNT = r"\d+|no|zero|one|a\s+single|two|three|four|five|six|seven|eight|nine|ten"
+
+
+def count_of(word: str) -> int | None:
+    word = " ".join(word.lower().split())
+    if word.isdigit():
+        return int(word) if len(word) <= 2 else None
+    return NUMBERS[word]
+
+
+def call_arity(inner: str) -> int:
+    if not inner.strip():
+        return 0
+    try:
+        call = ast.parse(f"_({inner})", mode="eval").body
+        return len(call.args) + len(call.keywords)
+    except SyntaxError:
+        depth, count = 0, 1
+        for ch in inner:
+            depth += ch in "([{"
+            depth -= ch in ")]}"
+            count += ch == "," and depth == 0
+        return count
+
+
+def answer_arity(answer: str | None, entry_point: str) -> int | None:
+    """Get the argument count the answer states, or None."""
+    text = " ".join((answer or "").split())
+    name = re.escape(entry_point)
+    stated = (
+        rf"\b(?:it|the function|{name})\s+(?:(?:should|must|only|now|also)\s+)?takes?\s+"
+        rf"(?:(?:exactly|only|just)\s+)?({COUNT})\s+(?:arguments?|parameters?|inputs?|values?)\b"
+    )
+    found = {count_of(m.group(1)) for m in re.finditer(stated, text, flags=re.IGNORECASE)}
+    for m in re.finditer(rf"\b{name}\(((?:[^()]|\([^()]*\))*)\)", text):
+        found.add(call_arity(m.group(1)))
+    found.discard(None)
+    return found.pop() if len(found) == 1 else None
+
+
+def method(cls: ast.AST | None, name: str):
+    if not isinstance(cls, ast.ClassDef):
+        return None
+    return next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
+
+
+def param_range(code: str, entry_point: str) -> tuple[int, float] | None:
+    """Return (min, max) positional args of entry_point, or None."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    kinds = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+    defs = {n.name: n for n in tree.body if isinstance(n, kinds)}
+    node, bound = defs.get(entry_point), False
+    for n in tree.body:
+        # alias added by bind_entry_point
+        if node is None and isinstance(n, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == entry_point for t in n.targets):
+                v = n.value
+                if isinstance(v, ast.Name):
+                    node = defs.get(v.id)
+                elif isinstance(v, ast.Attribute) and isinstance(v.value, ast.Call):
+                    if isinstance(v.value.func, ast.Name):
+                        node, bound = method(defs.get(v.value.func.id), v.attr), True
+    if isinstance(node, ast.ClassDef):
+        node, bound = method(node, "__init__"), True
+    if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        return None
+    static = any(isinstance(d, ast.Name) and d.id == "staticmethod" for d in node.decorator_list)
+    positional = [*node.args.posonlyargs, *node.args.args][1 if bound and not static else 0 :]
+    most = math.inf if node.args.vararg else len(positional)
+    return max(len(positional) - len(node.args.defaults), 0), most
+
+
+def takes(code: str, entry_point: str, count: int) -> bool:
+    span = param_range(code, entry_point)
+    return span is not None and span[0] <= count <= span[1]
+
+
 class InfoGainClarifier(ClarificationAlgorithmBase):
     DEFAULT_CONFIG = {
         "num_candidates": 3,  # programs sampled before asking
@@ -753,11 +1299,24 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "readback_without_def": True,  # no def line: the read-back too, instead of the call question
         "coding_rules": True,  # total functions, no assumed preconditions
         "time_limit": 200,  # seconds; past this, skip the optional steps (harness stops at 300)
+        "allow_any_code": True,  # file/network/shell tasks may import anything but evalplus
+        "answer_first_fallback": True,  # keep the final if the drafts fail too
+        "isolate_on_failure": True,  # rerun one program at a time if the batch dies
+        "typed_values": True,  # read back a DataFrame, array, set or object by type and shape
+        "expression_probes": True,  # DataFrame/array/date/class tasks: probes may construct objects
+        "contract_routing": True,  # a call of the entry point in the task counts as a signature
+        "error_aware": True,  # ask about errors when the task names them
+        "bind_answer_contract": False,  # "it takes N arguments" in the answer ranks the finals
+        "confirmed_draft": True,  # trust a plain yes, ignore a counter-question
+        "non_answer_brackets": True,  # ignore "(not specified)" asides
     }
 
     # per-task state, reset in run(); the repo validator rejects underscore attributes
     kept = ()  # programs that came back clean during the current task
     deadline = math.inf
+    read_draft = None  # the program the question read back
+    open_code = False  # file/network/shell task
+    spare_runs = 0  # one-by-one reruns left
 
     def over_time(self):
         return time.monotonic() > self.deadline
@@ -773,9 +1332,23 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
 
     # llm helpers
 
+    def contract(self, problem):
+        if self.config["contract_routing"]:
+            return contract_known(problem["prompt"], problem["entry_point"])
+        return has_signature(problem["prompt"])
+
+    def refusal(self, code):
+        """Reason to refuse the program, or None."""
+        if not self.config["allow_any_code"]:
+            return unsafe_reason(code)
+        if self.open_code:
+            return unsafe_reason(code, ALWAYS_BANNED, set())
+        return unsafe_reason(code, UNSAFE_MODULES | ALWAYS_BANNED)
+
     def generate(self, env, problem, context=""):
+        template = CODE_TEMPLATE.replace(NO_IO_SENTENCE, "") if self.open_code else CODE_TEMPLATE
         prompt = (
-            CODE_TEMPLATE.replace("{rules}", CODE_RULES if self.config["coding_rules"] else "")
+            template.replace("{rules}", CODE_RULES if self.config["coding_rules"] else "")
             .replace("{entry_point}", problem["entry_point"])
             .replace("{prompt}", problem["prompt"])
             .replace("{context}", context)
@@ -799,7 +1372,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
             else:
                 code = bind_entry_point(code, problem["entry_point"], problem["prompt"])
                 code = sanitize(code, problem["entry_point"])
-                reason = unsafe_reason(code)
+                reason = self.refusal(code)
                 if reason is None:
                     self.kept = [*self.kept, code]
                     return code
@@ -807,6 +1380,8 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
                     f"The code {reason}. Rewrite it as a plain function without files, network, "
                     "shell, eval or exec. Put the code in ```python and ```."
                 )
+                if self.open_code:
+                    feedback = f"The code {reason}, which is not available. Rewrite it without it. Put the code in ```python and ```."
             messages += [
                 {"role": "assistant", "content": response},
                 {"role": "user", "content": feedback},
@@ -814,9 +1389,15 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         return None
 
     def probes(self, env, problem):
+        expressions = self.config["expression_probes"] and typed_task(
+            problem["prompt"], problem["entry_point"]
+        )
+        template = PROBE_TEMPLATE
+        if expressions:
+            template = template.replace(PROBE_LITERALS, PROBE_EXPRESSIONS)
         response = self.chat(
             env,
-            PROBE_TEMPLATE.replace("{entry_point}", problem["entry_point"])
+            template.replace("{entry_point}", problem["entry_point"])
             .replace("{prompt}", problem["prompt"])
             .replace("{num_probes}", str(self.config["num_probes"])),
         )
@@ -826,7 +1407,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         try:
             probes = ast.literal_eval(block.strip())
         except (ValueError, SyntaxError):
-            return None
+            return expression_probes(block) if expressions else None
         if not isinstance(probes, list):
             return None
         return [p if isinstance(p, list | tuple) else [p] for p in probes]
@@ -845,17 +1426,41 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         except (json.JSONDecodeError, IndexError):
             return None
 
-    def run_programs(self, env, problem, candidates, probes):
-        """Outputs per program on the probes; programs that fail to load are left out."""
-        sources = {f"c{i}": c for i, c in enumerate(candidates)}
-        results = self.execute(
+    def sandbox(self, template):
+        """Add the network guard on open-code tasks."""
+        return guarded(template) if self.open_code else template
+
+    def batch(self, env, problem, programs, probes):
+        runner, extra = probe_runner(probes)
+        return self.execute(
             env,
-            RUNNER,
-            sources=repr(sources),
+            self.sandbox(runner),
+            sources=repr({f"c{i}": c for i, c in enumerate(programs)}),
             probes=repr(probes),
             entry=problem["entry_point"],
             deadline=EXEC_DEADLINE_SECONDS,
+            **extra,
         )
+
+    def probe_results(self, env, problem, programs, probes):
+        """Run the probes, one program at a time if the batch dies."""
+        results = self.batch(env, problem, programs, probes)
+        if not self.config["isolate_on_failure"] or len(programs) < 2 or not died(results):
+            return results
+        budget, self.spare_runs = self.spare_runs, 0  # one round per task
+        merged = {}
+        for i, program in enumerate(programs):
+            if budget <= 0 or self.over_time():
+                break
+            budget -= 1
+            alone = self.batch(env, problem, [program], probes)
+            if alone and "c0" in alone:
+                merged[f"c{i}"] = alone["c0"]
+        return merged or results
+
+    def run_programs(self, env, problem, candidates, probes):
+        """Outputs per program on the probes; programs that fail to load are left out."""
+        results = self.probe_results(env, problem, candidates, probes)
         if results is None:
             return {}
         return {name: outs for name, outs in results.items() if isinstance(outs, list) and outs}
@@ -865,22 +1470,28 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
     def evidence(self, problem, probes, outputs):
         lines = []
         for j in split_probes(outputs, self.config["max_evidence"]):
-            call = clip(f"{problem['entry_point']}({', '.join(repr(a) for a in probes[j])})")
+            call = clip(call_text(problem["entry_point"], probes[j]))
             groups = Counter(outs[j] for outs in outputs.values())
             shown = "; ".join(f"{n} program(s) return {clip(v, 80)}" for v, n in groups.items())
             lines.append(f"- {call}: {shown}")
         return "\n".join(lines)
 
+    def errors_open(self, problem):
+        return self.config["error_aware"] and mentions_errors(problem["prompt"])
+
     def write_question(self, env, problem, evidence):
-        open_call = not has_signature(problem["prompt"])
+        open_call = not self.contract(problem)
         call = CALL_NOTE if open_call and self.config["call_note"] else ""
         hint = HINT.replace("{lines}", evidence) if evidence else ""
         style = WITNESS_STYLE if self.config["witness"] else PLAIN_STYLE
         quote = ""
         if self.config["evidence_quote"]:
             quote = QUOTE_NOTE.replace("{none}", QUOTE_NONE if open_call else "")
+        template = QUESTION_TEMPLATE
+        if self.errors_open(problem):
+            template = template.replace(SKIP_ERRORS, ASK_ERRORS)
         prompt = (
-            QUESTION_TEMPLATE.replace("{prompt}", problem["prompt"])
+            template.replace("{prompt}", problem["prompt"])
             .replace("{call}", call)
             .replace("{evidence}", hint)
             .replace("{style}", style)
@@ -917,24 +1528,24 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         return name, candidates[int(name[1:])]
 
     @staticmethod
-    def example_call(problem, probes, outputs, name):
+    def example_call(problem, probes, outputs, name, typed=False):
         """An ordinary probe call and the output the program really gave, where the drafts split first."""
         if not name or not probes:
             return None
         outs = outputs[name]
         split = split_probes(outputs, len(outs))
         order = split + [j for j in range(len(outs)) if j not in split]
-        order.sort(key=lambda j: edge_input(probes[j]))  # stable: ordinary calls first
-        for j in order:
-            value = str(outs[j])
-            call = f"{problem['entry_point']}({', '.join(repr(a) for a in probes[j])})"
-            if len(call) > 120 or len(value) > 80:
-                continue
-            try:
-                ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                continue  # a crash, a set, an iterator or an object: nothing the user can read
-            return call, value
+        order.sort(key=lambda j: edge_probe(probes[j]))  # stable: ordinary calls first
+        calls = [(call_text(problem["entry_point"], probes[j]), str(outs[j])) for j in order]
+        calls = [(call, value) for call, value in calls if len(call) <= 120]
+        for call, value in calls:
+            if len(value) <= 80 and is_literal(value):
+                return call, value
+        # else a type summary
+        for call, value in calls if typed else ():
+            summary = type_summary(value)
+            if summary:
+                return call, summary
         return None
 
     def readback_question(self, env, problem, candidates, probes, outputs, evidence):
@@ -942,8 +1553,11 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         name, draft = self.leading(candidates, outputs)
         if len(draft) > DRAFT_LIMIT:
             return None
+        template = READBACK_TEMPLATE
+        if self.errors_open(problem):
+            template = template.replace(RULE_TAIL, RULE_ERRORS)
         prompt = fill(
-            READBACK_TEMPLATE,
+            template,
             prompt=problem["prompt"],
             draft=draft,
             evidence=READBACK_NOTES.replace("{lines}", evidence) if evidence else "",
@@ -957,7 +1571,8 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         parts = [fields.get(k) for k in ("ARGS", "RETURNS", "RULE")]
         if not all(parts):
             return None
-        example = self.example_call(problem, probes, outputs, name)
+        example = self.example_call(problem, probes, outputs, name, self.config["typed_values"])
+        self.read_draft = draft
         return render_readback(problem["entry_point"], *parts, example)
 
     def clean_task(self, env, problem):
@@ -1001,15 +1616,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
 
     def healthy(self, env, problem, programs, probes):
         """Programs that load and crash least on the probes; None if the sandbox run failed."""
-        sources = {f"c{i}": c for i, c in enumerate(programs)}
-        results = self.execute(
-            env,
-            RUNNER,
-            sources=repr(sources),
-            probes=repr(probes),
-            entry=problem["entry_point"],
-            deadline=EXEC_DEADLINE_SECONDS,
-        )
+        results = self.probe_results(env, problem, programs, probes)
         if results is None:
             return None
         crashes = {
@@ -1022,11 +1629,29 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         fewest = min(crashes.values())
         return [c for i, c in enumerate(programs) if crashes.get(f"c{i}") == fewest]
 
-    def select_final(self, env, problem, finals, tests, probes=None, fallback=None):
+    def last_resort(self, env, problem, finals, probes, fallback, check_drafts):
+        """Fall back to the drafts unless they fail too."""
+        if not (check_drafts and self.config["answer_first_fallback"]):
+            return fallback[0]
+        runs = self.healthy(env, problem, fallback, probes)
+        return finals[0] if runs == [] else fallback[0]
+
+    def select_final(
+        self,
+        env,
+        problem,
+        finals,
+        tests,
+        probes=None,
+        fallback=None,
+        arity=None,
+        check_drafts=False,
+        by_order=False,
+    ):
         if probes:
             ok = self.healthy(env, problem, finals, probes)
             if ok == [] and fallback:
-                return fallback[0]
+                return self.last_resort(env, problem, finals, probes, fallback, check_drafts)
             if ok:
                 finals = ok
         if len(finals) == 1:
@@ -1037,7 +1662,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
             scores = (
                 self.execute(
                     env,
-                    TEST_RUNNER,
+                    self.sandbox(TEST_RUNNER),
                     sources=repr(sources),
                     tests=repr(tests),
                     deadline=EXEC_DEADLINE_SECONDS,
@@ -1046,6 +1671,11 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
             )
         best = max(scores.values(), default=0)
         pool = [c for i, c in enumerate(finals) if scores.get(f"c{i}", 0) == best] or finals
+        if arity is not None:
+            # prefer the arity the user gave
+            pool = [c for c in pool if takes(c, problem["entry_point"], arity)] or pool
+        if by_order:
+            return pool[0]  # confirmed draft wins ties
         # tie-break: most common program, else the first
         return Counter(pool).most_common(1)[0][0]
 
@@ -1053,6 +1683,9 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
 
     def run(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
         self.kept = []
+        self.read_draft = None
+        self.open_code = False
+        self.spare_runs = 0
         self.deadline = time.monotonic() + self.config["time_limit"]
         try:
             return self.solve(env, problem)
@@ -1074,12 +1707,35 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
                 programs.append(code)
         return programs
 
+    def unsettled(self, answer):
+        """Check if the reply settles nothing."""
+        if says_nothing(answer, self.config["non_answer_brackets"]):
+            return True
+        return self.config["confirmed_draft"] and asks_back(answer)
+
+    def bind_contract(self, env, problem, finals, context, answer):
+        """Get the stated arity, adding a final that fits it if none does."""
+        if not (self.config["bind_answer_contract"] and answer):
+            return None, finals
+        entry = problem["entry_point"]
+        arity = answer_arity(answer, entry)
+        if arity is None or any(takes(f, entry, arity) for f in finals) or self.over_time():
+            return arity, finals
+        note = CONTRACT_NOTE.replace("{entry_point}", entry).replace("{count}", str(arity))
+        try:
+            extra = self.generate(env, problem, context + note)
+        except LimitsExceededException:
+            return arity, finals
+        return arity, [*finals, extra] if extra else finals
+
     def solve(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
+        self.open_code = self.config["allow_any_code"] and needs_any_code(problem["prompt"])
         if self.config["clean_contradictions"] and not has_signature(problem["prompt"]):
             problem = self.clean_task(env, problem)
         candidates = self.sample(env, problem, self.config["num_candidates"])
         if not candidates:
             return ""
+        self.spare_runs = len(candidates)
 
         probes = None if self.over_time() else self.probes(env, problem)
         outputs = self.run_programs(env, problem, candidates, probes) if probes else {}
@@ -1089,7 +1745,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         question = None
         if env.can_ask():
             readback = self.config["readback_question"] and (
-                has_signature(problem["prompt"]) or self.config["readback_without_def"]
+                self.contract(problem) or self.config["readback_without_def"]
             )
             if readback and not self.over_time():
                 question = self.readback_question(
@@ -1104,17 +1760,25 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
                 answer = None
 
         fallback = [candidates[int(name[1:])] for name in outputs] or candidates
-        if self.config["keep_on_non_answer"] and question and says_nothing(answer):
+        if self.config["keep_on_non_answer"] and question and self.unsettled(answer):
             # nothing was settled, so a program rewritten around the reply is only a fresh guess
             probes = None if self.over_time() else probes
             return self.select_final(env, problem, candidates, [], probes=probes, fallback=fallback)
 
         context = ANSWER_CONTEXT.format(question=question, answer=answer) if answer else ""
         finals = self.sample(env, problem, self.config["num_final"], context) or candidates[:1]
+        arity, finals = self.bind_contract(env, problem, finals, context, answer)
+        confirmed = bool(self.config["confirmed_draft"] and self.read_draft and confirms(answer))
+        if confirmed:
+            finals = [self.read_draft, *finals]
 
         tests = []
         if self.config["use_answer_tests"] and question and answer and not self.over_time():
             tests = self.answer_tests(env, problem, question, answer)
         if self.over_time():
             probes = None
-        return self.select_final(env, problem, finals, tests, probes=probes, fallback=fallback)
+        # test the drafts only if they never ran
+        check = bool(answer) and not outputs
+        return self.select_final(
+            env, problem, finals, tests, probes, fallback, arity, check, by_order=confirmed
+        )
