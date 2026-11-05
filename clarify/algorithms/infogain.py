@@ -28,8 +28,9 @@ Tasks that need files, the network or the shell may import anything; our own
 runs then block the network and evalplus. Tasks with DataFrames, arrays, dates
 or a class get probes that build such objects, and results with no literal form
 are read back by type and shape. A plain yes puts the read-back program first.
-Without a def line, calls with too many arguments are fitted to the function
-(CALL_ADAPTER, see issue #46).
+Positional calls with too many or too few arguments are fitted to the function
+(CALL_ADAPTER, see issue #46). The lower-case spelling of the name is bound too
+when it is free (issue #7).
 The smaller settings are listed in DEFAULT_CONFIG.
 
 Team: RankOne
@@ -40,6 +41,7 @@ Main Contact: mhaque@wm.edu
 from __future__ import annotations
 
 import ast
+import builtins
 import json
 import keyword
 import math
@@ -458,6 +460,7 @@ def _infogain_fit_calls(fn, name):
     if not params or b.any(p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params):
         return fn
     most = b.len(params)
+    least = b.sum(1 for p in params if p.default is p.empty)
     scope = fn.__globals__
 
     def fit(args):
@@ -480,9 +483,20 @@ def _infogain_fit_calls(fn, name):
                 del args[most:]
         return args
 
+    def grow(args):
+        if b.len(args) == 1 and b.isinstance(args[0], (b.list, b.tuple)):
+            if least <= b.len(args[0]) <= most:
+                return b.list(args[0])
+        sizes = [b.len(a) for a in args if b.isinstance(a, (b.list, b.tuple, b.str, b.dict, b.set))]
+        if sizes:
+            return b.list(args) + [sizes[0]] * (least - b.len(args))
+        return args
+
     def call(*args, **kwargs):
         if not kwargs and b.len(args) > most:
             args = fit(args)
+        elif not kwargs and b.len(args) < least:
+            args = grow(args)
         if scope.get(name) is not call:
             return fn(*args, **kwargs)
         scope[name] = fn  # recursion goes straight to fn
@@ -1373,7 +1387,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         "bind_answer_contract": False,  # "it takes N arguments" in the answer ranks the finals
         "confirmed_draft": True,  # trust a plain yes, ignore a counter-question
         "non_answer_brackets": True,  # ignore "(not specified)" asides
-        "call_adapter": True,  # fit calls with too many args when there is no def line
+        "call_adapter": True,  # fit mismatched calls, also bind a lower-case name
     }
 
     # per-task state, reset in run(); the repo validator rejects underscore attributes
@@ -1763,7 +1777,7 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
         return self.fit_calls(code, problem)
 
     def fit_calls(self, code, problem):
-        """Append CALL_ADAPTER to a program for a task without a def line."""
+        """Append CALL_ADAPTER and a lower-case alias of the entry point to a program."""
         if not self.config["call_adapter"]:
             return code
         try:
@@ -1772,9 +1786,13 @@ class InfoGainClarifier(ClarificationAlgorithmBase):
                 isinstance(entry, str) and entry.isidentifier() and not keyword.iskeyword(entry)
             ):
                 return code
-            if not (code and code.strip()) or "```" in code or has_signature(problem.get("prompt")):
+            if not (code and code.strip()) or "```" in code:
                 return code
             fitted = code.rstrip() + CALL_ADAPTER.replace("ENTRY", entry)
+            lower = entry.lower()
+            if lower != entry and not keyword.iskeyword(lower) and not hasattr(builtins, lower):
+                # some tasks give the name with capitals (issue #7)
+                fitted += f'\nif "{lower}" not in globals() and "{entry}" in globals():\n    {lower} = {entry}\n'
             ast.parse(code)
             ast.parse(fitted)
         except Exception:
